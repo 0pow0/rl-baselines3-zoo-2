@@ -8,7 +8,7 @@ import torch as th
 import yaml
 from huggingface_sb3 import EnvironmentName
 from stable_baselines3.common.callbacks import tqdm
-from stable_baselines3.common.utils import set_random_seed
+from stable_baselines3.common.utils import obs_as_tensor, set_random_seed
 
 import rl_zoo3.import_envs  # noqa: F401 pylint: disable=unused-import
 from rl_zoo3 import ALGOS, create_test_env, get_saved_hyperparams
@@ -72,6 +72,12 @@ def enjoy() -> None:  # noqa: C901
         action="store_true",
         default=False,
         help="if toggled, display a progress bar using tqdm and rich",
+    )
+    parser.add_argument(
+        "--value-stats-path",
+        type=str,
+        default="",
+        help="Path to a .pt file where observations, value predictions, and realized returns will be stored",
     )
     args = parser.parse_args()
 
@@ -204,6 +210,21 @@ def enjoy() -> None:  # noqa: C901
 
     obs = env.reset()
 
+    def _copy_obs(batch_obs, index):
+        if isinstance(batch_obs, dict):
+            return {key: np.array(value[index]) for key, value in batch_obs.items()}
+        if isinstance(batch_obs, np.ndarray):
+            return np.array(batch_obs[index])
+        return batch_obs[index]
+
+    track_values = args.value_stats_path != ""
+    value_traces = None
+    value_records = []
+    episode_counters = None
+    if track_values:
+        value_traces = [dict(observations=[], values=[], rewards=[]) for _ in range(env.num_envs)]
+        episode_counters = [0 for _ in range(env.num_envs)]
+
     # Deterministic by default except for atari games
     stochastic = args.stochastic or ((is_atari or is_minigrid) and not args.deterministic)
     deterministic = not stochastic
@@ -224,6 +245,15 @@ def enjoy() -> None:  # noqa: C901
 
     try:
         for _ in generator:
+            if track_values:
+                obs_tensor = obs_as_tensor(obs, model.device)
+                predicted_values = (
+                    model.policy.predict_values(obs_tensor).detach().cpu().numpy().reshape(env.num_envs)
+                )
+                for env_idx in range(env.num_envs):
+                    value_traces[env_idx]["observations"].append(_copy_obs(obs, env_idx))
+                    value_traces[env_idx]["values"].append(float(predicted_values[env_idx]))
+
             action, lstm_states = model.predict(
                 obs,  # type: ignore[arg-type]
                 state=lstm_states,
@@ -231,6 +261,10 @@ def enjoy() -> None:  # noqa: C901
                 deterministic=deterministic,
             )
             obs, reward, done, infos = env.step(action)
+
+            if track_values:
+                for env_idx in range(env.num_envs):
+                    value_traces[env_idx]["rewards"].append(float(reward[env_idx]))
 
             episode_start = done
 
@@ -268,6 +302,29 @@ def enjoy() -> None:  # noqa: C901
                         successes.append(infos[0].get("is_success", False))
                         episode_reward, ep_len = 0.0, 0
 
+            if track_values:
+                for env_idx in range(env.num_envs):
+                    if done[env_idx]:
+                        traces = value_traces[env_idx]
+                        if len(traces["observations"]) == len(traces["rewards"]):
+                            rewards = np.array(traces["rewards"], dtype=float)
+                            returns = np.cumsum(rewards[::-1])[::-1]
+                            for step_idx, (obs_snapshot, value_pred, ret) in enumerate(
+                                zip(traces["observations"], traces["values"], returns)
+                            ):
+                                value_records.append(
+                                    dict(
+                                        env_index=env_idx,
+                                        episode_index=episode_counters[env_idx],
+                                        timestep=step_idx,
+                                        observation=obs_snapshot,
+                                        value_prediction=float(value_pred),
+                                        returns=float(ret),
+                                    )
+                                )
+                        value_traces[env_idx] = dict(observations=[], values=[], rewards=[])
+                        episode_counters[env_idx] += 1
+
     except KeyboardInterrupt:
         pass
 
@@ -280,6 +337,30 @@ def enjoy() -> None:  # noqa: C901
 
     if args.verbose > 0 and len(episode_lengths) > 0:
         print(f"Mean episode length: {np.mean(episode_lengths):.2f} +/- {np.std(episode_lengths):.2f}")
+
+    if track_values:
+        save_path = args.value_stats_path
+        save_dir = os.path.dirname(save_path)
+        if save_dir != "":
+            os.makedirs(save_dir, exist_ok=True)
+        incomplete_steps = 0
+        if value_traces is not None:
+            incomplete_steps = sum(len(trace["observations"]) for trace in value_traces)
+        payload = dict(
+            records=value_records,
+            metadata=dict(
+                algo=algo,
+                env_id=env_name.gym_id,
+                n_timesteps=args.n_timesteps,
+                n_envs=env.num_envs,
+                incomplete_steps=incomplete_steps,
+            ),
+        )
+        th.save(payload, save_path)
+        if args.verbose > 0:
+            print(f"Saved {len(value_records)} value records to {save_path}")
+            if incomplete_steps > 0:
+                print(f"Skipped {incomplete_steps} steps from unfinished episodes when saving value stats")
 
     env.close()
 
