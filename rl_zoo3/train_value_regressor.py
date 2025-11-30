@@ -76,7 +76,7 @@ def load_dataset(args: argparse.Namespace) -> tuple[TensorDataset, dict[str, np.
         obs = rec.get("observation")
         if obs is None:
             continue
-        target = rec.get("returns")
+        target = rec.get("value_prediction")
         if target is None:
             continue
         flat = flatten_observation(obs)
@@ -204,14 +204,21 @@ def maybe_plot_validation_figures(
     targets_np = val_targets.numpy()
     preds_np = preds_np * target_stats["std"] + target_stats["mean"]
     targets_np = targets_np * target_stats["std"] + target_stats["mean"]
+    corr = 0.0
+    if preds_np.size > 1:
+        preds_centered = preds_np - preds_np.mean()
+        targets_centered = targets_np - targets_np.mean()
+        denom = np.linalg.norm(preds_centered) * np.linalg.norm(targets_centered)
+        if denom > 0:
+            corr = float(np.dot(preds_centered, targets_centered) / denom)
     plt.figure(figsize=(5, 5))
     plt.scatter(targets_np, preds_np, s=8, alpha=0.4)
     line_min = min(targets_np.min(), preds_np.min())
     line_max = max(targets_np.max(), preds_np.max())
     plt.plot([line_min, line_max], [line_min, line_max], "r--", label="ideal")
-    plt.xlabel("True Returns")
-    plt.ylabel("Predicted Returns")
-    plt.title("Validation Correlation")
+    plt.xlabel("True Values")
+    plt.ylabel("Predicted Values")
+    plt.title(f"Validation Correlation (corr={corr:.4f})")
     plt.legend()
     plt.grid(True, alpha=0.3)
     corr_plot_path = f"{prefix}_corr.png"
