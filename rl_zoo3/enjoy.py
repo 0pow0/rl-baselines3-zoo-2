@@ -8,7 +8,7 @@ import torch as th
 import yaml
 from huggingface_sb3 import EnvironmentName
 from stable_baselines3.common.callbacks import tqdm
-from stable_baselines3.common.utils import obs_as_tensor, set_random_seed
+from stable_baselines3.common.utils import set_random_seed
 
 import rl_zoo3.import_envs  # noqa: F401 pylint: disable=unused-import
 from rl_zoo3 import ALGOS, create_test_env, get_saved_hyperparams
@@ -221,9 +221,45 @@ def enjoy() -> None:  # noqa: C901
     value_traces = None
     value_records = []
     episode_counters = None
+    truncated_episodes = 0
+    truncated_steps = 0
     if track_values:
         value_traces = [dict(observations=[], values=[], rewards=[]) for _ in range(env.num_envs)]
         episode_counters = [0 for _ in range(env.num_envs)]
+
+    def flush_value_trace(env_idx: int, episode_done: bool) -> None:
+        nonlocal truncated_episodes, truncated_steps
+        if not track_values or value_traces is None or episode_counters is None:
+            return
+        traces = value_traces[env_idx]
+        length = min(len(traces["observations"]), len(traces["values"]), len(traces["rewards"]))
+        if length == 0:
+            value_traces[env_idx] = dict(observations=[], values=[], rewards=[])
+            if episode_done:
+                episode_counters[env_idx] += 1
+            return
+        rewards = np.array(traces["rewards"][:length], dtype=float)
+        returns = np.cumsum(rewards[::-1])[::-1]
+        for step_idx, (obs_snapshot, value_pred, ret) in enumerate(
+            zip(traces["observations"][:length], traces["values"][:length], returns)
+        ):
+            value_records.append(
+                dict(
+                    env_index=env_idx,
+                    episode_index=episode_counters[env_idx],
+                    timestep=step_idx,
+                    observation=obs_snapshot,
+                    value_prediction=float(value_pred),
+                    returns=float(ret),
+                    episode_done=episode_done,
+                )
+            )
+        value_traces[env_idx] = dict(observations=[], values=[], rewards=[])
+        if episode_done:
+            episode_counters[env_idx] += 1
+        else:
+            truncated_episodes += 1
+            truncated_steps += length
 
     # Deterministic by default except for atari games
     stochastic = args.stochastic or ((is_atari or is_minigrid) and not args.deterministic)
@@ -246,7 +282,7 @@ def enjoy() -> None:  # noqa: C901
     try:
         for _ in generator:
             if track_values:
-                obs_tensor = obs_as_tensor(obs, model.device)
+                obs_tensor, _ = model.policy.obs_to_tensor(obs)
                 predicted_values = (
                     model.policy.predict_values(obs_tensor).detach().cpu().numpy().reshape(env.num_envs)
                 )
@@ -305,25 +341,7 @@ def enjoy() -> None:  # noqa: C901
             if track_values:
                 for env_idx in range(env.num_envs):
                     if done[env_idx]:
-                        traces = value_traces[env_idx]
-                        if len(traces["observations"]) == len(traces["rewards"]):
-                            rewards = np.array(traces["rewards"], dtype=float)
-                            returns = np.cumsum(rewards[::-1])[::-1]
-                            for step_idx, (obs_snapshot, value_pred, ret) in enumerate(
-                                zip(traces["observations"], traces["values"], returns)
-                            ):
-                                value_records.append(
-                                    dict(
-                                        env_index=env_idx,
-                                        episode_index=episode_counters[env_idx],
-                                        timestep=step_idx,
-                                        observation=obs_snapshot,
-                                        value_prediction=float(value_pred),
-                                        returns=float(ret),
-                                    )
-                                )
-                        value_traces[env_idx] = dict(observations=[], values=[], rewards=[])
-                        episode_counters[env_idx] += 1
+                        flush_value_trace(env_idx, episode_done=True)
 
     except KeyboardInterrupt:
         pass
@@ -339,13 +357,13 @@ def enjoy() -> None:  # noqa: C901
         print(f"Mean episode length: {np.mean(episode_lengths):.2f} +/- {np.std(episode_lengths):.2f}")
 
     if track_values:
+        if value_traces is not None:
+            for env_idx in range(env.num_envs):
+                flush_value_trace(env_idx, episode_done=False)
         save_path = args.value_stats_path
         save_dir = os.path.dirname(save_path)
         if save_dir != "":
             os.makedirs(save_dir, exist_ok=True)
-        incomplete_steps = 0
-        if value_traces is not None:
-            incomplete_steps = sum(len(trace["observations"]) for trace in value_traces)
         payload = dict(
             records=value_records,
             metadata=dict(
@@ -353,14 +371,18 @@ def enjoy() -> None:  # noqa: C901
                 env_id=env_name.gym_id,
                 n_timesteps=args.n_timesteps,
                 n_envs=env.num_envs,
-                incomplete_steps=incomplete_steps,
+                truncated_episodes=truncated_episodes,
+                truncated_steps=truncated_steps,
+                total_records=len(value_records),
             ),
         )
         th.save(payload, save_path)
         if args.verbose > 0:
             print(f"Saved {len(value_records)} value records to {save_path}")
-            if incomplete_steps > 0:
-                print(f"Skipped {incomplete_steps} steps from unfinished episodes when saving value stats")
+            if truncated_steps > 0:
+                print(
+                    f"Included {truncated_steps} steps from {truncated_episodes} unfinished episodes when saving value stats"
+                )
 
     env.close()
 
