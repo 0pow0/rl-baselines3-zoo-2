@@ -23,6 +23,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=30, help="Training epochs")
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size")
     parser.add_argument("--learning-rate", type=float, default=3e-4, help="Adam learning rate")
+    parser.add_argument("--weight-decay", type=float, default=1e-5, help="Adam weight decay")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout probability applied after each hidden layer")
     parser.add_argument("--val-split", type=float, default=0.1, help="Fraction of data used for validation")
     parser.add_argument("--device", default="auto", help="Torch device (cpu, cuda, auto)")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
@@ -49,12 +51,15 @@ def flatten_observation(obs) -> np.ndarray:
 
 
 class ValueRegressor(nn.Module):
-    def __init__(self, input_dim: int, hidden_dims: Iterable[int]):
+    def __init__(self, input_dim: int, hidden_dims: Iterable[int], dropout: float = 0.0):
         super().__init__()
         layers: list[nn.Module] = []
         prev_dim = input_dim
         for hidden_dim in hidden_dims:
-            layers.extend([nn.Linear(prev_dim, hidden_dim), nn.ReLU()])
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(p=dropout))
             prev_dim = hidden_dim
         layers.append(nn.Linear(prev_dim, 1))
         self.net = nn.Sequential(*layers)
@@ -249,8 +254,8 @@ def main() -> None:
 
     sample_input, _ = train_dataset[0]
     input_dim = sample_input.numel()
-    model = ValueRegressor(input_dim, args.hidden_dims).to(device)
-    optimizer = th.optim.Adam(model.parameters(), lr=args.learning_rate)
+    model = ValueRegressor(input_dim, args.hidden_dims, dropout=max(args.dropout, 0.0)).to(device)
+    optimizer = th.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=max(args.weight_decay, 0.0))
     criterion = nn.MSELoss()
 
     train_history: list[float] = []
