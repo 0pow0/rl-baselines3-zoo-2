@@ -6,7 +6,7 @@ from typing import Iterable, Optional
 import numpy as np
 import torch as th
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split
+from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split, Subset, WeightedRandomSampler
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,6 +25,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=3e-4, help="Adam learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Adam weight decay")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout probability applied after each hidden layer")
+    parser.add_argument(
+        "--rebalance-targets",
+        action="store_true",
+        help="Enable frequency-based rebalancing of the training targets",
+    )
+    parser.add_argument(
+        "--rebalance-bins",
+        type=int,
+        default=20,
+        help="Histogram bins to compute frequency weights when rebalancing targets",
+    )
     parser.add_argument("--val-split", type=float, default=0.1, help="Fraction of data used for validation")
     parser.add_argument("--device", default="auto", help="Torch device (cpu, cuda, auto)")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
@@ -50,6 +61,29 @@ def flatten_observation(obs) -> np.ndarray:
     return arr.reshape(-1)
 
 
+def compute_rebalance_weights(target_vector: np.ndarray, bins: int) -> np.ndarray:
+    if target_vector.size == 0:
+        return np.empty(0, dtype=np.float32)
+    bins = max(int(bins), 1)
+    hist, bin_edges = np.histogram(target_vector, bins=bins)
+    hist = np.maximum(hist, 1)
+    bin_indices = np.searchsorted(bin_edges, target_vector, side="right") - 1
+    bin_indices = np.clip(bin_indices, 0, hist.shape[0] - 1)
+    weights = 1.0 / hist[bin_indices]
+    weights /= max(weights.mean(), 1e-6)
+    return weights.astype(np.float32)
+
+
+def get_subset_weights(dataset: Dataset, full_weights: th.Tensor) -> Optional[th.Tensor]:
+    if full_weights is None or full_weights.numel() == 0:
+        return None
+    if isinstance(dataset, Subset):
+        return full_weights[dataset.indices]
+    if len(dataset) == len(full_weights):
+        return full_weights
+    return None
+
+
 class ValueRegressor(nn.Module):
     def __init__(self, input_dim: int, hidden_dims: Iterable[int], dropout: float = 0.0):
         super().__init__()
@@ -68,7 +102,9 @@ class ValueRegressor(nn.Module):
         return self.net(inputs).squeeze(-1)
 
 
-def load_dataset(args: argparse.Namespace) -> tuple[TensorDataset, dict[str, np.ndarray], dict[str, float]]:
+def load_dataset(
+    args: argparse.Namespace,
+) -> tuple[TensorDataset, dict[str, np.ndarray], dict[str, float], Optional[th.Tensor]]:
     payload = th.load(args.data_path, map_location="cpu", weights_only=False)
     records = payload.get("records")
     if not isinstance(records, list) or len(records) == 0:
@@ -114,7 +150,11 @@ def load_dataset(args: argparse.Namespace) -> tuple[TensorDataset, dict[str, np.
         target_stats = dict(mean=0.0, std=1.0)
 
     dataset = TensorDataset(th.from_numpy(feature_matrix), th.from_numpy(target_vector))
-    return dataset, feature_stats, target_stats
+    sample_weights_tensor = None
+    if args.rebalance_targets:
+        weights_np = compute_rebalance_weights(target_vector, args.rebalance_bins)
+        sample_weights_tensor = th.from_numpy(weights_np)
+    return dataset, feature_stats, target_stats, sample_weights_tensor
 
 
 def split_dataset(dataset: TensorDataset, val_split: float, seed: int) -> tuple[Dataset, Optional[Dataset]]:
@@ -238,13 +278,26 @@ def main() -> None:
     set_seed(args.seed)
     device = th.device(args.device if args.device != "auto" else ("cuda" if th.cuda.is_available() else "cpu"))
 
-    dataset, feature_stats, target_stats = load_dataset(args)
+    dataset, feature_stats, target_stats, sample_weights = load_dataset(args)
     train_dataset, val_dataset = split_dataset(dataset, args.val_split, args.seed)
+
+    train_sampler = None
+    if args.rebalance_targets:
+        train_subset_weights = get_subset_weights(train_dataset, sample_weights)
+        if train_subset_weights is not None and train_subset_weights.numel() > 0:
+            train_sampler = WeightedRandomSampler(
+                weights=train_subset_weights.double(),
+                num_samples=len(train_subset_weights),
+                replacement=True,
+            )
+        else:
+            print("Warning: Unable to compute training sample weights; falling back to uniform sampling.")
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         drop_last=False,
     )
