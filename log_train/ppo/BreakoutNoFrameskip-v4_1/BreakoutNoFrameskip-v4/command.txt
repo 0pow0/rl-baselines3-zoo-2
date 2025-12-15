@@ -1,0 +1,1 @@
+/home/rzuo02/miniconda3/envs/sb3/bin/python3 /home/rzuo02/work/sb3/rl-baselines3-zoo/train.py --algo ppo --env BreakoutNoFrameskip-v4 -f /home/rzuo02/work/sb3/rl-baselines3-zoo/log_train --hyperparams gae_lambda:1.0
