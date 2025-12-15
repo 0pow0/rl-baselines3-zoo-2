@@ -7,6 +7,7 @@ import numpy as np
 import torch as th
 import yaml
 from huggingface_sb3 import EnvironmentName
+from stable_baselines3.common.buffers import RolloutBuffer
 from stable_baselines3.common.callbacks import tqdm
 from stable_baselines3.common.utils import set_random_seed
 
@@ -217,49 +218,24 @@ def enjoy() -> None:  # noqa: C901
             return np.array(batch_obs[index])
         return batch_obs[index]
 
+    def _copy_batch_obs(batch_obs):
+        if isinstance(batch_obs, dict):
+            return {key: np.array(value) for key, value in batch_obs.items()}
+        return np.array(batch_obs)
+
     track_values = args.value_stats_path != ""
-    value_traces = None
     value_records = []
-    episode_counters = None
     truncated_episodes = 0
     truncated_steps = 0
-    if track_values:
-        value_traces = [dict(observations=[], values=[], rewards=[]) for _ in range(env.num_envs)]
-        episode_counters = [0 for _ in range(env.num_envs)]
-
-    def flush_value_trace(env_idx: int, episode_done: bool) -> None:
-        nonlocal truncated_episodes, truncated_steps
-        if not track_values or value_traces is None or episode_counters is None:
-            return
-        traces = value_traces[env_idx]
-        length = min(len(traces["observations"]), len(traces["values"]), len(traces["rewards"]))
-        if length == 0:
-            value_traces[env_idx] = dict(observations=[], values=[], rewards=[])
-            if episode_done:
-                episode_counters[env_idx] += 1
-            return
-        rewards = np.array(traces["rewards"][:length], dtype=float)
-        returns = np.cumsum(rewards[::-1])[::-1]
-        for step_idx, (obs_snapshot, value_pred, ret) in enumerate(
-            zip(traces["observations"][:length], traces["values"][:length], returns)
-        ):
-            value_records.append(
-                dict(
-                    env_index=env_idx,
-                    episode_index=episode_counters[env_idx],
-                    timestep=step_idx,
-                    observation=obs_snapshot,
-                    value_prediction=float(value_pred),
-                    returns=float(ret),
-                    episode_done=episode_done,
-                )
-            )
-        value_traces[env_idx] = dict(observations=[], values=[], rewards=[])
-        if episode_done:
-            episode_counters[env_idx] += 1
-        else:
-            truncated_episodes += 1
-            truncated_steps += length
+    rollout_rewards: list[np.ndarray] = []
+    rollout_values: list[np.ndarray] = []
+    rollout_obs: list[list] = []
+    rollout_batch_obs: list = []
+    rollout_episode_starts: list[np.ndarray] = []
+    rollout_dones: list[np.ndarray] = []
+    gae_gamma = getattr(model, "gamma", 0.99)
+    gae_lambda = getattr(model, "gae_lambda", 1.0)
+    print(f"{gae_gamma=} {gae_lambda=}")
 
     # Deterministic by default except for atari games
     stochastic = args.stochastic or ((is_atari or is_minigrid) and not args.deterministic)
@@ -286,9 +262,11 @@ def enjoy() -> None:  # noqa: C901
                 predicted_values = (
                     model.policy.predict_values(obs_tensor).detach().cpu().numpy().reshape(env.num_envs)
                 )
-                for env_idx in range(env.num_envs):
-                    value_traces[env_idx]["observations"].append(_copy_obs(obs, env_idx))
-                    value_traces[env_idx]["values"].append(float(predicted_values[env_idx]))
+                rollout_rewards.append(np.zeros(env.num_envs, dtype=float))
+                rollout_values.append(predicted_values.astype(float))
+                rollout_obs.append([_copy_obs(obs, env_idx) for env_idx in range(env.num_envs)])
+                rollout_batch_obs.append(_copy_batch_obs(obs))
+                rollout_episode_starts.append(episode_start.astype(float))
 
             action, lstm_states = model.predict(
                 obs,  # type: ignore[arg-type]
@@ -299,8 +277,8 @@ def enjoy() -> None:  # noqa: C901
             obs, reward, done, infos = env.step(action)
 
             if track_values:
-                for env_idx in range(env.num_envs):
-                    value_traces[env_idx]["rewards"].append(float(reward[env_idx]))
+                rollout_rewards[-1] = reward.astype(float)
+                rollout_dones.append(done.astype(bool))
 
             episode_start = done
 
@@ -338,11 +316,6 @@ def enjoy() -> None:  # noqa: C901
                         successes.append(infos[0].get("is_success", False))
                         episode_reward, ep_len = 0.0, 0
 
-            if track_values:
-                for env_idx in range(env.num_envs):
-                    if done[env_idx]:
-                        flush_value_trace(env_idx, episode_done=True)
-
     except KeyboardInterrupt:
         pass
 
@@ -357,9 +330,61 @@ def enjoy() -> None:  # noqa: C901
         print(f"Mean episode length: {np.mean(episode_lengths):.2f} +/- {np.std(episode_lengths):.2f}")
 
     if track_values:
-        if value_traces is not None:
-            for env_idx in range(env.num_envs):
-                flush_value_trace(env_idx, episode_done=False)
+        buffer_size = len(rollout_rewards)
+        if buffer_size > 0:
+            rollout_buffer = RolloutBuffer(
+                buffer_size,
+                env.observation_space,
+                env.action_space,
+                device=model.device,
+                gae_lambda=gae_lambda,
+                gamma=gae_gamma,
+                n_envs=env.num_envs,
+            )
+            action_placeholder = np.zeros((env.num_envs, rollout_buffer.action_dim), dtype=float)
+            log_prob_placeholder = th.zeros((env.num_envs, 1), device=model.device)
+            for idx in range(buffer_size):
+                rollout_buffer.add(
+                    rollout_batch_obs[idx],
+                    action_placeholder,
+                    rollout_rewards[idx],
+                    rollout_episode_starts[idx],
+                    th.as_tensor(rollout_values[idx], device=model.device),
+                    log_prob_placeholder,
+                )
+            with th.no_grad():
+                last_values = model.policy.predict_values(model.policy.obs_to_tensor(obs)[0])
+            rollout_buffer.compute_returns_and_advantage(last_values=last_values, dones=rollout_dones[-1])
+            returns = rollout_buffer.returns
+            episode_counters = [0 for _ in range(env.num_envs)]
+            for step_idx in range(buffer_size):
+                for env_idx in range(env.num_envs):
+                    episode_done = bool(rollout_dones[step_idx][env_idx]) if step_idx < len(rollout_dones) else False
+                    value_records.append(
+                        dict(
+                            env_index=env_idx,
+                            episode_index=episode_counters[env_idx],
+                            timestep=step_idx,
+                            observation=rollout_obs[step_idx][env_idx],
+                            value_prediction=float(rollout_values[step_idx][env_idx]),
+                            returns=float(returns[step_idx, env_idx]),
+                            episode_done=episode_done,
+                        )
+                    )
+                    if episode_done:
+                        episode_counters[env_idx] += 1
+
+            truncated_episodes = 0
+            truncated_steps = 0
+            if len(rollout_dones) > 0:
+                for env_idx in range(env.num_envs):
+                    last_done_idx = -1
+                    for sidx, done_vec in enumerate(rollout_dones):
+                        if done_vec[env_idx]:
+                            last_done_idx = sidx
+                    if last_done_idx < buffer_size - 1:
+                        truncated_episodes += 1
+                        truncated_steps += buffer_size - last_done_idx - 1
         save_path = args.value_stats_path
         save_dir = os.path.dirname(save_path)
         if save_dir != "":
